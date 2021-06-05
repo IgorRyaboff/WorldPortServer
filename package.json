@@ -1,0 +1,27 @@
+{
+    "name": "worldportserver",
+    "version": "0.1.0",
+    "description": "Server for WorldPort app",
+    "main": "server.js",
+    "bin": {
+        "worldportserver": "node server"
+    },
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "start": "node server.js"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/IgorRyaboff/WorldPortServer.git"
+    },
+    "author": "Igor Ryabov",
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/IgorRyaboff/WorldPortServer/issues"
+    },
+    "homepage": "https://github.com/IgorRyaboff/WorldPortServer#readme",
+    "dependencies": {
+        "node-args-parser": "0.0.1",
+        "websocket": "^1.0.34"
+    }
+}
