@@ -17,7 +17,7 @@ let config = {
     allowAnonymous: true,
     aliveCheckInterval: 10000,
     aliveCheckTimeout: 20000,
-    webSocketPort: 100
+    webSocketPort: 101
 };
 if (fs.existsSync('./config.json')) config = require('./config.json');
 
