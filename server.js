@@ -2,14 +2,17 @@
 
 const version = require('./package.json').version;
 const net = require('net');
+const tls = require('tls');
 const http = require('http');
 const websocket = require('websocket');
 const fs = require('fs');
 const ArgsParser = require('node-args-parser');
+const Express = require('express');
+const https = require('https');
 let args = ArgsParser(process.argv);
 
 let config = {
-    minPort: 200,
+    minPort: 201,
     maxPort: 65535,
     users: {
         json: './users.json'
@@ -17,9 +20,18 @@ let config = {
     allowAnonymous: true,
     aliveCheckInterval: 10000,
     aliveCheckTimeout: 20000,
-    webSocketPort: 101
+    webSocketPort: 100,
+    expressServerPort: 200,
+    tls: {
+        key: './privkey.pem',
+        cert: './cert.pem'
+    }
 };
 if (fs.existsSync('./config.json')) config = require('./config.json');
+const tlsOptions = {
+    key: fs.readFileSync(config.tls.key),
+    cert: fs.readFileSync(config.tls.cert)
+};
 
 let users = {};
 if (config.users && config.users.json && fs.existsSync(config.users.json)) users = require(config.users.json);
@@ -38,7 +50,7 @@ function makeid(length) {
 function randomInteger(min, max) {
     let rand = min - 0.5 + Math.random() * (max - min + 1);
     return Math.round(rand);
-  }
+}
 
 class Session {
     id = '';
@@ -113,7 +125,7 @@ class Session {
         });
         this.#server.listen(this.externalPort);
 
-        this.#s2Server = net.createServer(socket => {
+        this.#s2Server = tls.createServer(tlsOptions, socket => {
             let id;
             socket.on('data', chunk => {
                 if (id && this.sockets[id]) this.sockets[id][0].write(chunk);
@@ -217,7 +229,7 @@ class Session {
     }
 }
 
-let apiServer = http.createServer((rq, rp) => {
+let apiServer = https.createServer(tlsOptions, (rq, rp) => {
     rp.writeHead(403);
     rp.end();
 });
@@ -273,7 +285,7 @@ wsServer.on('connect', con => {
                 while (sessions[id]) id = makeid(3);
                 con.removeAllListeners();
                 clearTimeout(closeTO);
-                sessions[id] = new Session(id, makeid(8), parseInt(port), con);
+                sessions[id] = new Session(id, makeid(64), parseInt(port), con);
                 break;
             }
             case 'session.resurrect': {
@@ -290,3 +302,30 @@ wsServer.on('connect', con => {
 });
 
 console.log('Server started');
+
+if (config.expressServerPort) {
+    let expressServer = Express();
+    expressServer.get('/sessionInfo/:id', (rq, rp) => {
+        let s = sessions[rq.params.id];
+        rp.end(s ? JSON.stringify({
+            ok: true,
+            id: s.id,
+            externalPort: s.externalPort,
+            token: s.token.substr(0, 6) + Array(58).fill('*').join('')
+        }, null, 4) : JSON.stringify({ ok: false }, null, 4));
+    });
+
+    expressServer.get('/sessions', (rq, rp) => {
+        let list = {};
+        for (let i in sessions) list[i] = sessions[i].externalPort;
+
+        rp.end(JSON.stringify({
+            ok: true,
+            list: list
+        }, null, 4));
+    });
+
+    let httpsServer = https.createServer(tlsOptions, expressServer);
+
+    httpsServer.listen(config.expressServerPort);
+}

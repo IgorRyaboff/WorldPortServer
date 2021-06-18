@@ -21,6 +21,7 @@
     },
     "homepage": "https://github.com/IgorRyaboff/WorldPortServer#readme",
     "dependencies": {
+        "express": "^4.17.1",
         "node-args-parser": "0.0.1",
         "websocket": "^1.0.34"
     }
