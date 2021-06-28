@@ -1,6 +1,6 @@
 {
     "name": "worldportserver",
-    "version": "0.1.0",
+    "version": "0.1.2",
     "description": "Server for WorldPort app",
     "main": "server.js",
     "bin": {
@@ -21,8 +21,9 @@
     },
     "homepage": "https://github.com/IgorRyaboff/WorldPortServer#readme",
     "dependencies": {
+        "dotenv-defaults": "^2.0.2",
         "express": "^4.17.1",
-        "node-args-parser": "0.0.1",
+        "stream-throttle": "^0.1.3",
         "websocket": "^1.0.34"
     }
 }

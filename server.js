@@ -6,35 +6,20 @@ const tls = require('tls');
 const http = require('http');
 const websocket = require('websocket');
 const fs = require('fs');
-const ArgsParser = require('node-args-parser');
 const Express = require('express');
 const https = require('https');
-let args = ArgsParser(process.argv);
-
-let config = {
-    minPort: 201,
-    maxPort: 65535,
-    users: {
-        json: './users.json'
-    },
-    allowAnonymous: true,
-    aliveCheckInterval: 10000,
-    aliveCheckTimeout: 20000,
-    webSocketPort: 100,
-    expressServerPort: 200,
-    tls: {
-        key: './privkey.pem',
-        cert: './cert.pem'
-    }
-};
-if (fs.existsSync('./config.json')) config = require('./config.json');
+const { ThrottleGroup } = require('stream-throttle');
+require('dotenv-defaults').config({
+    defaults: './.env.defaults'
+});;
 const tlsOptions = {
-    key: fs.readFileSync(config.tls.key),
-    cert: fs.readFileSync(config.tls.cert)
+    key: fs.readFileSync(process.env.tlsKey),
+    cert: fs.readFileSync(process.env.tlsCert)
 };
 
 let users = {};
-if (config.users && config.users.json && fs.existsSync(config.users.json)) users = require(config.users.json);
+if (process.env.usersList && fs.existsSync(process.env.usersList)) users = require(process.env.usersList);
+global.u = users;
 
 function makeid(length) {
     var result = [];
@@ -85,6 +70,11 @@ class Session {
     #apiSocketReconTO;
 
     /**
+     * @type {ThrottleGroup}
+     */
+    #throttleGroup;
+
+    /**
      * @type {net.Server}
      */
     #server;
@@ -93,26 +83,36 @@ class Session {
      */
     #s2Server;
 
-    constructor(id, token, port, apiSocket) {
-        console.log('new session yay', id, port);
+    user;
+
+    constructor(id, token, port, apiSocket, user) {
+        console.log(`New session #${id} on ext port ${port}, user ${user}`);
         this.id = id;
         this.token = token;
+        this.user = user;
         this.externalPort = parseInt(port);
+        if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) this.#throttleGroup = new ThrottleGroup({ rate: 1024 * 1024 * (+process.env.bandwidthLimit) / 8 });
+        //console.log(`BW limit for ${user}`, (+process.env.bandwidthLimit), users[this.user], users[this.user]?.ignoreBandwidthLimit, !!this.#throttleGroup);
 
-        this.#server = net.createServer(socket => {
+        this.#server = net.createServer(s1 => {
             let id = makeid(2);
             while (this.sockets[id]) id = makeid(2);
             console.log(`Incoming socket ${id} in session ${this.id}`);
-            this.sockets[id] = [socket, false, []];
+            if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) {
+                let throttledS1 = this.#throttleGroup.throttle();
+                throttledS1.pipe(s1);
+                this.sockets[id] = [throttledS1, false, []];
+            }
+            else this.sockets[id] = [s1, false, []];
 
-            socket.on('data', chunk => {
+            s1.on('data', chunk => {
                 if (!this.sockets[id]) return;
                 if (this.sockets[id][1]) this.sockets[id][1].write(chunk);
                 else this.sockets[id][2].push(chunk);
             });
 
-            socket.on('error', () => { });
-            socket.on('close', () => {
+            s1.on('error', () => { });
+            s1.on('close', () => {
                 if (this.sockets[id]) {
                     if (this.sockets[id][1]) this.sockets[id][1].end();
                     delete this.sockets[id];
@@ -125,23 +125,28 @@ class Session {
         });
         this.#server.listen(this.externalPort);
 
-        this.#s2Server = tls.createServer(tlsOptions, socket => {
+        this.#s2Server = tls.createServer(tlsOptions, s2 => {
             let id;
-            socket.on('data', chunk => {
+            s2.on('data', chunk => {
                 if (id && this.sockets[id]) this.sockets[id][0].write(chunk);
                 else {
                     id = chunk.toString();
                     if (this.sockets[id]) {
-                        this.sockets[id][1] = socket;
-                        this.sockets[id][2].forEach(chunk => socket.write(chunk));
+                        if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) {
+                            let throttledS2 = this.#throttleGroup.throttle();
+                            throttledS2.pipe(s2);
+                            this.sockets[id][1] = throttledS2;
+                        }
+                        else this.sockets[id][1] = s2;
+                        this.sockets[id][2].forEach(chunk => this.sockets[id][1].write(chunk));
                         console.log(`S2 created for socket ${id} in session ${this.id}`);
                     }
-                    else socket.end();
+                    else s2.end();
                 }
             });
 
-            socket.on('error', () => { });
-            socket.on('close', () => {
+            s2.on('error', () => { });
+            s2.on('close', () => {
                 if (this.sockets[id]) this.sockets[id][0].end();
                 delete this.sockets[id];
             });
@@ -161,10 +166,10 @@ class Session {
         let lastAliveCheck = new Date;
         let aliveCheckInterval = setInterval(() => {
             this.send('aliveCheck');
-        }, config.aliveCheckInterval);
+        }, (+process.env.aliveCheckInterval));
         let aliveCheckTimeoutChecker = setInterval(() => {
-            if (new Date - lastAliveCheck >= config.aliveCheckTimeout) {
-                console.log('Client did not aliveCheck last 20 seconds. Connection will be closed, session ' + this.id);
+            if (new Date - lastAliveCheck >= (+process.env.aliveCheckTimeout)) {
+                console.log('AliveCheck timed out. Connection will be closed, session ' + this.id);
                 con.close();
             }
         }, 1000);
@@ -176,10 +181,10 @@ class Session {
             catch (_e) { }
 
             if (!data || !data._e) return;
-            if (args.d) console.log(`${this.id}: ${data._e}`);
+            if (process.env.debug == 1) console.log(`${this.id}: ${data._e}`);
             switch (data._e) {
                 case 'aliveCheck': {
-                    if (args.d) console.log(this.id + ': aliveCheck recieved');
+                    if (process.env.debug == 1) console.log(this.id + ': aliveCheck recieved');
                     lastAliveCheck = new Date;
                     break;
                 }
@@ -205,8 +210,9 @@ class Session {
             port: this.externalPort,
             token: this.token,
             v: version,
-            aliveCheckInterval: config.aliveCheckInterval,
-            aliveCheckTimeout: config.aliveCheckTimeout
+            aliveCheckInterval: (+process.env.aliveCheckInterval),
+            aliveCheckTimeout: (+process.env.aliveCheckTimeout),
+            bandwidthLimit: this.#throttleGroup ? (+process.env.bandwidthLimit) : 0
         });
     }
 
@@ -233,7 +239,7 @@ let apiServer = https.createServer(tlsOptions, (rq, rp) => {
     rp.writeHead(403);
     rp.end();
 });
-apiServer.listen(config.webSocketPort);
+apiServer.listen((+process.env.webSocketPort));
 
 let wsServer = new websocket.server({
     httpServer: apiServer,
@@ -261,7 +267,7 @@ wsServer.on('connect', con => {
         switch (data._e) {
             case 'session.create': {
                 if (data.authMethod == 'credentials') {
-                    if (data.login || !config.allowAnonymous) {
+                    if (data.login || !(+process.env.allowAnonymous)) {
                         if (!users[data.login]) return con.close(4008, '!Unknown login');
                         if (users[data.login].password != data.password) return con.close(4008, '!Wrong password');
                     }
@@ -270,22 +276,22 @@ wsServer.on('connect', con => {
 
                 if (Object.keys(sessions).length >= 45000) return con.close(4004);
                 let port = 0;
-                if (!isNaN(data.externalPort) && data.externalPort >= config.minPort && data.externalPort <= config.maxPort - 10000) {
+                if (!isNaN(data.externalPort) && data.externalPort >= (+process.env.minPort) && data.externalPort <= (+process.env.maxPort) - 10000) {
                     if (Object.values(sessions).some(s => data.externalPort == s.externalPort || data.externalPort == s.externalPort + 10000)) {
                         if (data.forceExternalPort) return con.close(4003);
                     }
                     else port = data.externalPort;
                 }
                 if (!port) {
-                    port = randomInteger(config.minPort, config.maxPort - 10000);
-                    while (Object.values(sessions).some(s => port == s.externalPort || port == s.externalPort + 10000)) port = randomInteger(config.minPort, config.maxPort - 10000);
+                    port = randomInteger((+process.env.minPort), (+process.env.maxPort) - 10000);
+                    while (Object.values(sessions).some(s => port == s.externalPort || port == s.externalPort + 10000)) port = randomInteger((+process.env.minPort), (+process.env.maxPort) - 10000);
                 }
 
                 let id = makeid(3);
                 while (sessions[id]) id = makeid(3);
                 con.removeAllListeners();
                 clearTimeout(closeTO);
-                sessions[id] = new Session(id, makeid(64), parseInt(port), con);
+                sessions[id] = new Session(id, makeid(64), parseInt(port), con, data.login || '');
                 break;
             }
             case 'session.resurrect': {
@@ -303,7 +309,7 @@ wsServer.on('connect', con => {
 
 console.log('Server started');
 
-if (config.expressServerPort) {
+if ((+process.env.expressServerPort)) {
     let expressServer = Express();
     expressServer.get('/sessionInfo/:id', (rq, rp) => {
         let s = sessions[rq.params.id];
@@ -327,5 +333,5 @@ if (config.expressServerPort) {
 
     let httpsServer = https.createServer(tlsOptions, expressServer);
 
-    httpsServer.listen(config.expressServerPort);
+    httpsServer.listen((+process.env.expressServerPort));
 }
