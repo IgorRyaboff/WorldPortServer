@@ -9,6 +9,7 @@ const fs = require('fs');
 const Express = require('express');
 const https = require('https');
 const { ThrottleGroup } = require('stream-throttle');
+const path = require('path');
 require('dotenv-defaults').config({
     defaults: './.env.defaults'
 });;
@@ -35,6 +36,29 @@ function makeid(length) {
 function randomInteger(min, max) {
     let rand = min - 0.5 + Math.random() * (max - min + 1);
     return Math.round(rand);
+}
+
+function formatDate(date) {
+    const adjustZeros = (x, required = 2) => {
+        x = String(x);
+        while (x.length < required) x = '0' + x;
+        return x;
+    }
+    if (!(date instanceof Date)) date = new Date(+date);
+
+    let Y = date.getFullYear();
+    let M = adjustZeros(date.getMonth() + 1);
+    let D = adjustZeros(date.getDate());
+
+    let h = adjustZeros(date.getHours());
+    let m = adjustZeros(date.getMinutes());
+    let s = adjustZeros(date.getUTCSeconds());
+    let ms = adjustZeros(date.getMilliseconds(), 3);
+
+    return `${D}.${M}.${Y} ${h}:${m}:${s}.${ms}`;
+}
+function log(...args) {
+    console.log(`[${formatDate(new Date)}]`, ...args);
 }
 
 class Session {
@@ -86,18 +110,18 @@ class Session {
     user;
 
     constructor(id, token, port, apiSocket, user) {
-        console.log(`New session #${id} on ext port ${port}, user ${user}`);
+        log(`New session #${id} on ext port ${port}, user: ${user ? '"' + user + '"' : '<anon>'}`);
         this.id = id;
         this.token = token;
         this.user = user;
         this.externalPort = parseInt(port);
         if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) this.#throttleGroup = new ThrottleGroup({ rate: 1024 * 1024 * (+process.env.bandwidthLimit) / 8 });
-        //console.log(`BW limit for ${user}`, (+process.env.bandwidthLimit), users[this.user], users[this.user]?.ignoreBandwidthLimit, !!this.#throttleGroup);
+        //log(`BW limit for ${user}`, (+process.env.bandwidthLimit), users[this.user], users[this.user]?.ignoreBandwidthLimit, !!this.#throttleGroup);
 
         this.#server = net.createServer(s1 => {
             let id = makeid(2);
             while (this.sockets[id]) id = makeid(2);
-            console.log(`Incoming socket ${id} in session ${this.id}`);
+            if (process.env.debug == 1) log(`S1 ${id}@${this.id} created`);
             if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) {
                 let throttledS1 = this.#throttleGroup.throttle();
                 throttledS1.pipe(s1);
@@ -113,6 +137,7 @@ class Session {
 
             s1.on('error', () => { });
             s1.on('close', () => {
+                if (process.env.debug == 1) log(`S1 ${id}@${this.id} destroyed`);
                 if (this.sockets[id]) {
                     if (this.sockets[id][1]) this.sockets[id][1].end();
                     delete this.sockets[id];
@@ -139,7 +164,7 @@ class Session {
                         }
                         else this.sockets[id][1] = s2;
                         this.sockets[id][2].forEach(chunk => this.sockets[id][1].write(chunk));
-                        console.log(`S2 created for socket ${id} in session ${this.id}`);
+                        if (process.env.debug == 1) log(`S2 ${id}@${this.id} created`);
                     }
                     else s2.end();
                 }
@@ -147,6 +172,7 @@ class Session {
 
             s2.on('error', () => { });
             s2.on('close', () => {
+                if (process.env.debug == 1) log(`S2 ${id}@${this.id} destroyed`);
                 if (this.sockets[id]) this.sockets[id][0].end();
                 delete this.sockets[id];
             });
@@ -169,7 +195,7 @@ class Session {
         }, (+process.env.aliveCheckInterval));
         let aliveCheckTimeoutChecker = setInterval(() => {
             if (new Date - lastAliveCheck >= (+process.env.aliveCheckTimeout)) {
-                console.log('AliveCheck timed out. Connection will be closed, session ' + this.id);
+                log('AliveCheck timed out. Connection will be closed, session ' + this.id);
                 con.close();
             }
         }, 1000);
@@ -181,17 +207,16 @@ class Session {
             catch (_e) { }
 
             if (!data || !data._e) return;
-            if (process.env.debug == 1) console.log(`${this.id}: ${data._e}`);
+            if (process.env.debug == 1) log(`${this.id}: ${data._e}`);
             switch (data._e) {
                 case 'aliveCheck': {
-                    if (process.env.debug == 1) console.log(this.id + ': aliveCheck recieved');
                     lastAliveCheck = new Date;
                     break;
                 }
             }
         });
         con.on('error', e => {
-            console.log(`Error in apiSocket: ${e}`);
+            log(`Error in apiSocket: ${e}`);
         });
         con.on('close', code => {
             this.#apiSocket = false;
@@ -224,7 +249,7 @@ class Session {
     }
 
     end() {
-        console.log(`Session ${this.id} destroyed`);
+        log(`Session #${this.id} destroyed`);
         this.isOpened = false;
         delete sessions[this.id];
         if (this.#apiSocket) this.#apiSocket.close(4001);
@@ -261,7 +286,7 @@ wsServer.on('connect', con => {
         try {
             data = JSON.parse(msg.utf8Data);
         }
-        catch (_e) { console.log('-a') }
+        catch (_e) { log('-a') }
 
         if (!data || !data._e) return;
         switch (data._e) {
@@ -307,11 +332,16 @@ wsServer.on('connect', con => {
     });
 });
 
-console.log('Server started');
+log('Server started');
 
 if ((+process.env.expressServerPort)) {
     let expressServer = Express();
-    expressServer.get('/sessionInfo/:id', (rq, rp) => {
+    expressServer.get('/help', (rq, rp) => {
+        rp.type('html');
+        rp.sendFile(path.resolve('./html/help.html'));
+    });
+
+    expressServer.get('/session/:id', (rq, rp) => {
         let s = sessions[rq.params.id];
         rp.end(s ? JSON.stringify({
             ok: true,
