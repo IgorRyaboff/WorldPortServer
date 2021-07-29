@@ -17,6 +17,7 @@ const tlsOptions = {
     key: fs.readFileSync(process.env.tlsKey),
     cert: fs.readFileSync(process.env.tlsCert)
 };
+if (process.env.tlsCA) tlsOptions.ca = fs.readFileSync(process.env.tlsCA);
 
 let users = {};
 if (process.env.usersList && fs.existsSync(process.env.usersList)) users = require(process.env.usersList);
