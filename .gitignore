@@ -1,5 +1,6 @@
 config.json
 users.json
+userGroups.json
 
 # Logs
 logs

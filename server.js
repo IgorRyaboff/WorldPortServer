@@ -10,18 +10,53 @@ const Express = require('express');
 const https = require('https');
 const { ThrottleGroup } = require('stream-throttle');
 const path = require('path');
-require('dotenv-defaults').config({
-    defaults: './.env.defaults'
-});;
+const checkPort = require('./portChecker');
+const deepmerge = require('deepmerge');
+
+let config = {
+    minPort: 201,
+    maxPort: 65535,
+    usersList: './users.json',
+    userGroupsList: './userGroups.json',
+    allowAnonymous: 1,
+    aliveCheckInterval: 10000,
+    aliveCheckTimeout: 20000,
+    webSocketPort: 100,
+    expressServerPort: 200,
+    tlsKey: './privkey.pem',
+    tlsCert: './cert.pem',
+    bandwidthLimit: 0
+}
+if (fs.existsSync('./config.json')) config = deepmerge(config, require('./config.json'));
+
 const tlsOptions = {
-    key: fs.readFileSync(process.env.tlsKey),
-    cert: fs.readFileSync(process.env.tlsCert)
+    key: fs.readFileSync(config.tlsKey),
+    cert: fs.readFileSync(config.tlsCert)
 };
-if (process.env.tlsCA) tlsOptions.ca = fs.readFileSync(process.env.tlsCA);
+if (config.tlsCA) tlsOptions.ca = fs.readFileSync(config.tlsCA);
 
 let users = {};
-if (process.env.usersList && fs.existsSync(process.env.usersList)) users = require(process.env.usersList);
-global.u = users;
+let userGroups = {};
+function reloadUsers() {
+    users = JSON.parse(fs.readFileSync(config.usersList).toString());
+    for (let i in sessions) sessions[i].reloadCfg();
+    console.log('Users reloaded');
+}
+function reloadUserGroups() {
+    userGroups = JSON.parse(fs.readFileSync(config.userGroupsList).toString());
+    for (let i in sessions) sessions[i].reloadCfg();
+    console.log('User groups reloaded');
+}
+setTimeout(() => {
+    if (config.usersList && fs.existsSync(config.usersList)) {
+        fs.watchFile(config.usersList, {}, () => reloadUsers());
+        reloadUsers();
+    }
+    if (config.userGroupsList && fs.existsSync(config.userGroupsList)) {
+        fs.watchFile(config.userGroupsList, {}, () => reloadUserGroups());
+        reloadUserGroups();
+    }
+}, 1);
 
 function makeid(length) {
     var result = [];
@@ -109,21 +144,25 @@ class Session {
     #s2Server;
 
     user;
+    /**
+     * @type {config}
+     */
+    ucfg;
 
-    constructor(id, token, port, apiSocket, user) {
+    constructor(id, token, port, apiSocket, user, ucfg) {
         log(`New session #${id} on ext port ${port}, user: ${user ? '"' + user + '"' : '<anon>'}`);
+        this.ucfg = ucfg;
         this.id = id;
         this.token = token;
         this.user = user;
         this.externalPort = parseInt(port);
-        if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) this.#throttleGroup = new ThrottleGroup({ rate: 1024 * 1024 * (+process.env.bandwidthLimit) / 8 });
-        //log(`BW limit for ${user}`, (+process.env.bandwidthLimit), users[this.user], users[this.user]?.ignoreBandwidthLimit, !!this.#throttleGroup);
+        if (+this.ucfg.bandwidthLimit) this.#throttleGroup = new ThrottleGroup({ rate: 1024 * 1024 * (+this.ucfg.bandwidthLimit) / 8 });
 
         this.#server = net.createServer(s1 => {
             let id = makeid(2);
             while (this.sockets[id]) id = makeid(2);
-            if (process.env.debug == 1) log(`S1 ${id}@${this.id} created`);
-            if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) {
+            if (config.debug == 1) log(`S1 ${id}@${this.id} created`);
+            if (+this.ucfg.bandwidthLimit) {
                 let throttledS1 = this.#throttleGroup.throttle();
                 throttledS1.pipe(s1);
                 this.sockets[id] = [throttledS1, false, []];
@@ -138,7 +177,7 @@ class Session {
 
             s1.on('error', () => { });
             s1.on('close', () => {
-                if (process.env.debug == 1) log(`S1 ${id}@${this.id} destroyed`);
+                if (config.debug == 1) log(`S1 ${id}@${this.id} destroyed`);
                 if (this.sockets[id]) {
                     if (this.sockets[id][1]) this.sockets[id][1].end();
                     delete this.sockets[id];
@@ -158,14 +197,14 @@ class Session {
                 else {
                     id = chunk.toString();
                     if (this.sockets[id]) {
-                        if ((+process.env.bandwidthLimit) && !users[this.user]?.ignoreBandwidthLimit) {
+                        if (+this.ucfg.bandwidthLimit) {
                             let throttledS2 = this.#throttleGroup.throttle();
                             throttledS2.pipe(s2);
                             this.sockets[id][1] = throttledS2;
                         }
                         else this.sockets[id][1] = s2;
                         this.sockets[id][2].forEach(chunk => this.sockets[id][1].write(chunk));
-                        if (process.env.debug == 1) log(`S2 ${id}@${this.id} created`);
+                        if (config.debug == 1) log(`S2 ${id}@${this.id} created`);
                     }
                     else s2.end();
                 }
@@ -173,7 +212,7 @@ class Session {
 
             s2.on('error', () => { });
             s2.on('close', () => {
-                if (process.env.debug == 1) log(`S2 ${id}@${this.id} destroyed`);
+                if (config.debug == 1) log(`S2 ${id}@${this.id} destroyed`);
                 if (this.sockets[id]) this.sockets[id][0].end();
                 delete this.sockets[id];
             });
@@ -193,9 +232,9 @@ class Session {
         let lastAliveCheck = new Date;
         let aliveCheckInterval = setInterval(() => {
             this.send('aliveCheck');
-        }, (+process.env.aliveCheckInterval));
+        }, (+this.ucfg.aliveCheckInterval));
         let aliveCheckTimeoutChecker = setInterval(() => {
-            if (new Date - lastAliveCheck >= (+process.env.aliveCheckTimeout)) {
+            if (new Date - lastAliveCheck >= (+this.ucfg.aliveCheckTimeout)) {
                 log('AliveCheck timed out. Connection will be closed, session ' + this.id);
                 con.close();
             }
@@ -208,7 +247,7 @@ class Session {
             catch (_e) { }
 
             if (!data || !data._e) return;
-            if (process.env.debug == 1) log(`${this.id}: ${data._e}`);
+            if (config.debug == 1) log(`${this.id}: ${data._e}`);
             switch (data._e) {
                 case 'aliveCheck': {
                     lastAliveCheck = new Date;
@@ -221,7 +260,7 @@ class Session {
         });
         con.on('close', code => {
             this.#apiSocket = false;
-            if (code == 1000) this.end();
+            if (code == 1000 || code == 4010) this.end();
             else this.#apiSocketReconTO = setTimeout(() => {
                 this.end();
             }, 10000);
@@ -236,9 +275,9 @@ class Session {
             port: this.externalPort,
             token: this.token,
             v: version,
-            aliveCheckInterval: (+process.env.aliveCheckInterval),
-            aliveCheckTimeout: (+process.env.aliveCheckTimeout),
-            bandwidthLimit: this.#throttleGroup ? (+process.env.bandwidthLimit) : 0
+            aliveCheckInterval: (+this.ucfg.aliveCheckInterval),
+            aliveCheckTimeout: (+this.ucfg.aliveCheckTimeout),
+            bandwidthLimit: this.#throttleGroup ? (+this.ucfg.bandwidthLimit) : 0
         });
     }
 
@@ -259,13 +298,18 @@ class Session {
         this.#s2Server.close();
         Object.values(this.sockets).forEach(pair => pair[0].end());
     }
+
+    reloadCfg() {
+        this.#apiSocket.close(4010);
+        log(`Session #${this.id} is ressetting`);
+    }
 }
 
 let apiServer = https.createServer(tlsOptions, (rq, rp) => {
     rp.writeHead(403);
     rp.end();
 });
-apiServer.listen((+process.env.webSocketPort));
+apiServer.listen((+config.webSocketPort));
 
 let wsServer = new websocket.server({
     httpServer: apiServer,
@@ -282,7 +326,7 @@ wsServer.on('connect', con => {
         con.close(4002);
     }, 5000);
 
-    con.on('message', msg => {
+    con.on('message', async msg => {
         let data;
         try {
             data = JSON.parse(msg.utf8Data);
@@ -292,32 +336,41 @@ wsServer.on('connect', con => {
         if (!data || !data._e) return;
         switch (data._e) {
             case 'session.create': {
+                /**
+                 * @type {config}
+                 */
+                let ucfg = JSON.parse(JSON.stringify(config));
                 if (data.authMethod == 'credentials') {
-                    if (data.login || !(+process.env.allowAnonymous)) {
+                    if (data.login || !(+config.allowAnonymous)) {
                         if (!users[data.login]) return con.close(4008, '!Unknown login');
-                        if (users[data.login].password != data.password) return con.close(4008, '!Wrong password');
+                        if (Array.isArray(users[data.login].groups)) users[data.login].groups.forEach(i => {
+                            let ug = userGroups[i];
+                            if (ug) ucfg = deepmerge(ucfg, ug);
+                        });
+                        ucfg = deepmerge(ucfg, users[data.login]);
+                        if (ucfg.password && ucfg.password != data.password) return con.close(4008, '!Wrong password');
                     }
                 }
                 else return con.close(4008, '!Unknown authMethod ' + data.authMethod);
 
                 if (Object.keys(sessions).length >= 45000) return con.close(4004);
                 let port = 0;
-                if (!isNaN(data.externalPort) && data.externalPort >= (+process.env.minPort) && data.externalPort <= (+process.env.maxPort) - 10000) {
-                    if (Object.values(sessions).some(s => data.externalPort == s.externalPort || data.externalPort == s.externalPort + 10000)) {
+                if (!isNaN(data.externalPort) && data.externalPort >= (+ucfg.minPort) && data.externalPort <= +ucfg.maxPort) {
+                    if (!await checkPort(data.externalPort) || !await checkPort(data.externalPort + 10000)) {
                         if (data.forceExternalPort) return con.close(4003);
                     }
                     else port = data.externalPort;
                 }
                 if (!port) {
-                    port = randomInteger((+process.env.minPort), (+process.env.maxPort) - 10000);
-                    while (Object.values(sessions).some(s => port == s.externalPort || port == s.externalPort + 10000)) port = randomInteger((+process.env.minPort), (+process.env.maxPort) - 10000);
+                    port = randomInteger((+ucfg.minPort), +ucfg.maxPort);
+                    while (!await checkPort(data.externalPort) || !await checkPort(data.externalPort + 10000)) port = randomInteger((+ucfg.minPort), +ucfg.maxPort);
                 }
 
                 let id = makeid(3);
                 while (sessions[id]) id = makeid(3);
                 con.removeAllListeners();
                 clearTimeout(closeTO);
-                sessions[id] = new Session(id, makeid(64), parseInt(port), con, data.login || '');
+                sessions[id] = new Session(id, makeid(64), parseInt(port), con, data.login || '', ucfg);
                 break;
             }
             case 'session.resurrect': {
@@ -335,7 +388,7 @@ wsServer.on('connect', con => {
 
 log('Server started');
 
-if ((+process.env.expressServerPort)) {
+if ((+config.expressServerPort)) {
     let expressServer = Express();
     expressServer.get('/help', (rq, rp) => {
         rp.type('html');
@@ -364,5 +417,5 @@ if ((+process.env.expressServerPort)) {
 
     let httpsServer = https.createServer(tlsOptions, expressServer);
 
-    httpsServer.listen((+process.env.expressServerPort));
+    httpsServer.listen((+config.expressServerPort));
 }
